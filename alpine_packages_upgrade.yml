@@ -1,0 +1,23 @@
+---
+- name: Upgrade Alpine packages
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Update APK package index
+      community.general.apk:
+        update_cache: true
+
+    - name: Upgrade all installed packages
+      community.general.apk:
+        upgrade: true
+
+    - name: Show Alpine version
+      ansible.builtin.command: cat /etc/alpine-release
+      register: alpine_version
+      changed_when: false
+
+    - name: Display current Alpine version
+      ansible.builtin.debug:
+        msg: "Current Alpine version: {{ alpine_version.stdout }}"
