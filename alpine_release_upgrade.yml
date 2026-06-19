@@ -1,7 +1,6 @@
 ---
 - name: Upgrade Alpine release
   hosts: all
-  become: true
   gather_facts: false
 
   tasks:
