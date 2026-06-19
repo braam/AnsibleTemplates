@@ -1,0 +1,41 @@
+---
+- name: Upgrade Alpine release
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Read current Alpine version
+      ansible.builtin.command: cat /etc/alpine-release
+      register: version_before
+      changed_when: false
+
+    - name: Update package index
+      community.general.apk:
+        update_cache: true
+
+    - name: Upgrade apk-tools
+      community.general.apk:
+        name: apk-tools
+        state: latest
+
+    - name: Perform Alpine release upgrade
+      ansible.builtin.command: apk upgrade --available
+      register: upgrade_result
+      changed_when: "'Upgrading' in upgrade_result.stdout or 'installing' in upgrade_result.stdout"
+
+    - name: Read Alpine version after upgrade
+      ansible.builtin.command: cat /etc/alpine-release
+      register: version_after
+      changed_when: false
+
+    - name: Show version change
+      ansible.builtin.debug:
+        msg:
+          - "Before: {{ version_before.stdout }}"
+          - "After: {{ version_after.stdout }}"
+
+    - name: Reboot if version changed
+      ansible.builtin.reboot:
+        reboot_timeout: 600
+      when: version_before.stdout != version_after.stdout
