@@ -2,7 +2,7 @@
 - name: Upgrade Alpine release
   hosts: all
   become: true
-  gather_facts: true
+  gather_facts: false
 
   tasks:
     - name: Read current Alpine version
