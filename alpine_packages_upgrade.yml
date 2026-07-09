@@ -4,8 +4,10 @@
   gather_facts: false
 
   tasks:
-    - name: Update APK package index
+    - name: Ensure python3 is installed
       community.general.apk:
+        name: python3
+        state: present
         update_cache: true
 
     - name: Upgrade all installed packages
