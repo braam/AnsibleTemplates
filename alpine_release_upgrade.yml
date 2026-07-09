@@ -1,24 +1,28 @@
 ---
-- name: Upgrade Alpine release
+- name: Full Alpine System Upgrade
   hosts: all
   gather_facts: false
 
   tasks:
-    - name: Read current Alpine version
+    - name: Ensure python3 is installed (via raw to bypass dependency check)
+      ansible.builtin.raw: "apk update && apk add python3"
+      register: python_install
+      changed_when: "'Installing' in python_install.stdout"
+
+    - name: Read current Alpine version before upgrade
       ansible.builtin.command: cat /etc/alpine-release
       register: version_before
       changed_when: false
 
-    - name: Update package index
+    - name: Update APK package index
       community.general.apk:
         update_cache: true
 
-    - name: Upgrade apk-tools
+    - name: Upgrade all installed packages
       community.general.apk:
-        name: apk-tools
-        state: latest
+        upgrade: true
 
-    - name: Perform Alpine release upgrade
+    - name: Perform full release upgrade (available)
       ansible.builtin.command: apk upgrade --available
       register: upgrade_result
       changed_when: "'Upgrading' in upgrade_result.stdout or 'installing' in upgrade_result.stdout"
@@ -30,9 +34,13 @@
 
     - name: Show version change
       ansible.builtin.debug:
-        msg:
-          - "Before: {{ version_before.stdout }}"
-          - "After: {{ version_after.stdout }}"
+        msg: "The Alpine version has changed from {{ version_before.stdout }} to {{ version_after.stdout }}"
+      when: version_before.stdout != version_after.stdout
+
+    - name: Report no changes
+      ansible.builtin.debug:
+        msg: "No release upgrade detected. Current version remains: {{ version_before.stdout }}"
+      when: version_before.stdout == version_after.stdout
 
     - name: Reboot if version changed
       ansible.builtin.reboot:
