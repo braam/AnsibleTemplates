@@ -4,15 +4,15 @@
   gather_facts: false
 
   tasks:
-    - name: Ensure python3 is installed
-      community.general.apk:
-        name: python3
-        state: present
-        update_cache: true
+    - name: Install Python3 via raw module (no Python required on host)
+      ansible.builtin.raw: "apk update && apk add python3"
+      register: python_install
+      changed_when: "'Installing' in python_install.stdout"
 
     - name: Upgrade all installed packages
       community.general.apk:
         upgrade: true
+        update_cache: true
 
     - name: Show Alpine version
       ansible.builtin.command: cat /etc/alpine-release
