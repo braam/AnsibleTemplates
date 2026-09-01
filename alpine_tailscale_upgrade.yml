@@ -1,0 +1,21 @@
+---
+- name: Upgrade Tailscale on Alpine
+  hosts: all
+  gather_facts: false
+
+  tasks:
+    - name: Upgrade Tailscale
+      community.general.apk:
+        name: tailscale
+        state: latest
+        update_cache: true
+
+    - name: Get Tailscale version
+      ansible.builtin.command:
+        cmd: tailscale version
+      register: tailscale_version
+      changed_when: false
+
+    - name: Show Tailscale version
+      ansible.builtin.debug:
+        msg: "{{ tailscale_version.stdout }}"
