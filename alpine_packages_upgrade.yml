@@ -1,6 +1,7 @@
 ---
 - name: Upgrade Alpine packages
   hosts: all
+  serial: 1
   gather_facts: false
 
   tasks:
