@@ -7,6 +7,8 @@
   vars:
     compose_root: /opt
     compose_filename: docker-compose.yml
+    excluded_paths:
+      - /opt/containerd
 
   tasks:
 
@@ -39,14 +41,17 @@
 
     - name: Set Docker Compose availability
       ansible.builtin.set_fact:
-        compose_available: "{{ compose_version.rc == 0 }}"
-      when: docker_available
+        compose_available: "{{ docker_available and compose_version.rc == 0 }}"
 
     # ============================================================
-    # Find Compose files
-    # Expected structure:
+    # Find all Docker Compose files below /opt
     #
-    # /opt/<application>/docker-compose.yml
+    # Example:
+    #
+    # /opt/zabbix/docker-compose.yml       -> included
+    # /opt/nginx/docker-compose.yml        -> included
+    # /opt/containerd/docker-compose.yml   -> excluded
+    #
     # ============================================================
 
     - name: Find Docker Compose files
@@ -54,9 +59,25 @@
         paths: "{{ compose_root }}"
         patterns:
           - "{{ compose_filename }}"
-        recurse: false
+        recurse: true
         file_type: file
       register: compose_files
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Exclude /opt/containerd
+    # ============================================================
+
+    - name: Filter excluded Compose paths
+      ansible.builtin.set_fact:
+        compose_files_filtered: >-
+          {{
+            compose_files.files
+            | rejectattr('path', 'match', '^/opt/containerd(/|$)')
+            | list
+          }}
       when:
         - docker_available
         - compose_available
@@ -69,9 +90,11 @@
       ansible.builtin.set_fact:
         compose_projects: >-
           {{
-            compose_files.files
+            compose_files_filtered
             | map(attribute='path')
             | map('dirname')
+            | unique
+            | sort
             | list
           }}
       when:
@@ -79,7 +102,23 @@
         - compose_available
 
     # ============================================================
-    # Get images defined by Docker Compose
+    # Show discovered Compose projects
+    # ============================================================
+
+    - name: Show discovered Compose projects
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Compose projects: {{ compose_projects | default([]) }}"
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Get images from every Compose project
+    #
+    # docker compose config --images resolves the Compose file
+    # and returns the actual images used by the project.
     # ============================================================
 
     - name: Get images from Docker Compose projects
@@ -99,6 +138,22 @@
         - compose_available
 
     # ============================================================
+    # Show Compose errors, if any
+    # ============================================================
+
+    - name: Report Compose configuration errors
+      ansible.builtin.debug:
+        msg:
+          - "Compose project: {{ item.item }}"
+          - "Return code: {{ item.rc }}"
+          - "Error: {{ item.stderr }}"
+      loop: "{{ compose_image_results.results | default([]) }}"
+      when:
+        - docker_available
+        - compose_available
+        - item.rc != 0
+
+    # ============================================================
     # Build unique image list
     # ============================================================
 
@@ -110,6 +165,8 @@
             | selectattr('rc', 'equalto', 0)
             | map(attribute='stdout_lines')
             | flatten
+            | map('trim')
+            | reject('equalto', '')
             | unique
             | sort
             | list
@@ -119,7 +176,20 @@
         - compose_available
 
     # ============================================================
-    # Get local image digests
+    # Show discovered images
+    # ============================================================
+
+    - name: Show discovered Docker images
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Images: {{ docker_images | default([]) }}"
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Get local image information
     # ============================================================
 
     - name: Inspect local Docker images
@@ -137,10 +207,10 @@
         - compose_available
 
     # ============================================================
-    # Get remote image manifests
+    # Get remote image manifest
     #
-    # This uses Docker directly.
-    # No Skopeo or additional packages are required.
+    # No image is pulled.
+    # Docker only queries the registry.
     # ============================================================
 
     - name: Inspect remote Docker manifests
@@ -169,10 +239,10 @@
         - compose_available
 
     # ============================================================
-    # Compare local and remote digests
+    # Process every image
     # ============================================================
 
-    - name: Compare image digests
+    - name: Compare local and remote image information
       ansible.builtin.set_fact:
         image_results: >-
           {{
@@ -187,7 +257,7 @@
       vars:
 
         # --------------------------------------------------------
-        # Find local inspection result
+        # Local image result
         # --------------------------------------------------------
 
         local_result: >-
@@ -212,7 +282,7 @@
           }}
 
         # --------------------------------------------------------
-        # Find remote manifest result
+        # Remote manifest result
         # --------------------------------------------------------
 
         remote_result: >-
@@ -230,12 +300,28 @@
             | from_json
           }}
 
+        # --------------------------------------------------------
+        # Remote digest
+        #
+        # Docker manifest inspect --verbose normally returns:
+        #
+        # {
+        #   "Descriptor": {
+        #       "digest": "sha256:..."
+        #   }
+        # }
+        #
+        # --------------------------------------------------------
+
         remote_digest: >-
           {{
-            remote_json.Descriptor.Digest
+            remote_json.Descriptor.digest
             | default(
-                remote_json.Digest
-                | default('unknown')
+                remote_json.Descriptor.Digest
+                | default(
+                    remote_json.Digest
+                    | default('unknown')
+                )
               )
           }}
 
@@ -267,7 +353,7 @@
         - compose_available
 
     # ============================================================
-    # Count available updates
+    # Get only images with available updates
     # ============================================================
 
     - name: Get available updates
@@ -283,7 +369,7 @@
         - compose_available
 
     # ============================================================
-    # Display results
+    # Display final report
     # ============================================================
 
     - name: Display Docker image update report
@@ -291,8 +377,10 @@
         msg: |
           ============================================================
           Docker Image Update Report
-          Host: {{ inventory_hostname }}
           ============================================================
+
+          Host:
+            {{ inventory_hostname }}
 
           Docker:
             {{ docker_version.stdout | default('Not installed') }}
@@ -301,18 +389,27 @@
             {{ compose_version.stdout | default('Not available') }}
 
           Compose projects:
-          {% for project in compose_projects | default([]) %}
+          {% if compose_projects | default([]) | length > 0 %}
+          {% for project in compose_projects %}
             - {{ project }}
           {% endfor %}
+          {% else %}
+            None
+          {% endif %}
 
           Images:
-          {% for image in image_results | default([]) %}
-            {{ "%-50s" | format(image.image) }} {{ image.status }}
+          {% if image_results | default([]) | length > 0 %}
+          {% for image in image_results %}
+            {{ "%-55s" | format(image.image) }} {{ image.status }}
           {% endfor %}
+          {% else %}
+            No images found.
+          {% endif %}
 
           Updates available:
             {{ available_updates | default([]) | length }}
 
+          ============================================================
       when: docker_available
 
     # ============================================================
@@ -324,14 +421,19 @@
         msg: |
           ============================================================
           Docker Image Update Report
-          Host: {{ inventory_hostname }}
           ============================================================
 
-          Docker: NOT INSTALLED
+          Host:
+            {{ inventory_hostname }}
+
+          Docker:
+            NOT INSTALLED
+
+          ============================================================
       when: not docker_available
 
     # ============================================================
-    # Report Compose not available
+    # Report hosts without Docker Compose
     # ============================================================
 
     - name: Report Docker Compose not available
@@ -339,11 +441,18 @@
         msg: |
           ============================================================
           Docker Image Update Report
-          Host: {{ inventory_hostname }}
           ============================================================
 
-          Docker: {{ docker_version.stdout }}
-          Docker Compose: NOT AVAILABLE
+          Host:
+            {{ inventory_hostname }}
+
+          Docker:
+            {{ docker_version.stdout }}
+
+          Docker Compose:
+            NOT AVAILABLE
+
+          ============================================================
       when:
         - docker_available
         - not compose_available
