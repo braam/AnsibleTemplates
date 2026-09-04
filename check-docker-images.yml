@@ -2,6 +2,7 @@
 - name: Check Docker Compose image updates
   hosts: all
   become: true
+  serial: 1
   gather_facts: false
 
   vars:
