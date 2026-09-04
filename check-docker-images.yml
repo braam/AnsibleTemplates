@@ -1,0 +1,349 @@
+---
+- name: Check Docker Compose image updates
+  hosts: all
+  become: true
+  gather_facts: false
+
+  vars:
+    compose_root: /opt
+    compose_filename: docker-compose.yml
+
+  tasks:
+
+    # ============================================================
+    # Check Docker
+    # ============================================================
+
+    - name: Check if Docker is installed
+      ansible.builtin.command:
+        cmd: docker --version
+      register: docker_version
+      changed_when: false
+      failed_when: false
+
+    - name: Set Docker availability
+      ansible.builtin.set_fact:
+        docker_available: "{{ docker_version.rc == 0 }}"
+
+    # ============================================================
+    # Check Docker Compose
+    # ============================================================
+
+    - name: Check if Docker Compose is available
+      ansible.builtin.command:
+        cmd: docker compose version
+      register: compose_version
+      changed_when: false
+      failed_when: false
+      when: docker_available
+
+    - name: Set Docker Compose availability
+      ansible.builtin.set_fact:
+        compose_available: "{{ compose_version.rc == 0 }}"
+      when: docker_available
+
+    # ============================================================
+    # Find Compose files
+    # Expected structure:
+    #
+    # /opt/<application>/docker-compose.yml
+    # ============================================================
+
+    - name: Find Docker Compose files
+      ansible.builtin.find:
+        paths: "{{ compose_root }}"
+        patterns:
+          - "{{ compose_filename }}"
+        recurse: false
+        file_type: file
+      register: compose_files
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Build list of Compose project directories
+    # ============================================================
+
+    - name: Build Compose project list
+      ansible.builtin.set_fact:
+        compose_projects: >-
+          {{
+            compose_files.files
+            | map(attribute='path')
+            | map('dirname')
+            | list
+          }}
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Get images defined by Docker Compose
+    # ============================================================
+
+    - name: Get images from Docker Compose projects
+      ansible.builtin.command:
+        cmd: >
+          docker compose
+          -f {{ item }}/{{ compose_filename }}
+          config --images
+      args:
+        chdir: "{{ item }}"
+      loop: "{{ compose_projects | default([]) }}"
+      register: compose_image_results
+      changed_when: false
+      failed_when: false
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Build unique image list
+    # ============================================================
+
+    - name: Build unique Docker image list
+      ansible.builtin.set_fact:
+        docker_images: >-
+          {{
+            compose_image_results.results
+            | selectattr('rc', 'equalto', 0)
+            | map(attribute='stdout_lines')
+            | flatten
+            | unique
+            | sort
+            | list
+          }}
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Get local image digests
+    # ============================================================
+
+    - name: Inspect local Docker images
+      ansible.builtin.command:
+        cmd: >
+          docker image inspect
+          --format {% raw %}'{{json .RepoDigests}}'{% endraw %}
+          {{ item }}
+      loop: "{{ docker_images | default([]) }}"
+      register: local_image_results
+      changed_when: false
+      failed_when: false
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Get remote image manifests
+    #
+    # This uses Docker directly.
+    # No Skopeo or additional packages are required.
+    # ============================================================
+
+    - name: Inspect remote Docker manifests
+      ansible.builtin.command:
+        cmd: >
+          docker manifest inspect
+          --verbose
+          {{ item }}
+      loop: "{{ docker_images | default([]) }}"
+      register: remote_manifest_results
+      changed_when: false
+      failed_when: false
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Initialize result list
+    # ============================================================
+
+    - name: Initialize image results
+      ansible.builtin.set_fact:
+        image_results: []
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Compare local and remote digests
+    # ============================================================
+
+    - name: Compare image digests
+      ansible.builtin.set_fact:
+        image_results: >-
+          {{
+            image_results +
+            [{
+              'image': item.item,
+              'local_digest': local_digest,
+              'remote_digest': remote_digest,
+              'status': image_status
+            }]
+          }}
+      vars:
+
+        # --------------------------------------------------------
+        # Find local inspection result
+        # --------------------------------------------------------
+
+        local_result: >-
+          {{
+            local_image_results.results
+            | selectattr('item', 'equalto', item.item)
+            | first
+            | default({})
+          }}
+
+        local_repodigests: >-
+          {{
+            local_result.stdout
+            | default('[]')
+            | from_json
+          }}
+
+        local_digest: >-
+          {{
+            local_repodigests[0]
+            | default('unknown')
+          }}
+
+        # --------------------------------------------------------
+        # Find remote manifest result
+        # --------------------------------------------------------
+
+        remote_result: >-
+          {{
+            remote_manifest_results.results
+            | selectattr('item', 'equalto', item.item)
+            | first
+            | default({})
+          }}
+
+        remote_json: >-
+          {{
+            remote_result.stdout
+            | default('{}')
+            | from_json
+          }}
+
+        remote_digest: >-
+          {{
+            remote_json.Descriptor.Digest
+            | default(
+                remote_json.Digest
+                | default('unknown')
+              )
+          }}
+
+        # --------------------------------------------------------
+        # Determine status
+        # --------------------------------------------------------
+
+        image_status: >-
+          {{
+            'NOT INSTALLED'
+            if local_result.rc | default(1) != 0
+            else
+            'REGISTRY CHECK FAILED'
+            if remote_result.rc | default(1) != 0
+            else
+            'UP TO DATE'
+            if (
+              local_digest != 'unknown'
+              and remote_digest != 'unknown'
+              and remote_digest in local_digest
+            )
+            else
+            'UPDATE AVAILABLE'
+          }}
+
+      loop: "{{ remote_manifest_results.results | default([]) }}"
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Count available updates
+    # ============================================================
+
+    - name: Get available updates
+      ansible.builtin.set_fact:
+        available_updates: >-
+          {{
+            image_results
+            | selectattr('status', 'equalto', 'UPDATE AVAILABLE')
+            | list
+          }}
+      when:
+        - docker_available
+        - compose_available
+
+    # ============================================================
+    # Display results
+    # ============================================================
+
+    - name: Display Docker image update report
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          Docker Image Update Report
+          Host: {{ inventory_hostname }}
+          ============================================================
+
+          Docker:
+            {{ docker_version.stdout | default('Not installed') }}
+
+          Docker Compose:
+            {{ compose_version.stdout | default('Not available') }}
+
+          Compose projects:
+          {% for project in compose_projects | default([]) %}
+            - {{ project }}
+          {% endfor %}
+
+          Images:
+          {% for image in image_results | default([]) %}
+            {{ "%-50s" | format(image.image) }} {{ image.status }}
+          {% endfor %}
+
+          Updates available:
+            {{ available_updates | default([]) | length }}
+
+      when: docker_available
+
+    # ============================================================
+    # Report hosts without Docker
+    # ============================================================
+
+    - name: Report Docker not installed
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          Docker Image Update Report
+          Host: {{ inventory_hostname }}
+          ============================================================
+
+          Docker: NOT INSTALLED
+      when: not docker_available
+
+    # ============================================================
+    # Report Compose not available
+    # ============================================================
+
+    - name: Report Docker Compose not available
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          Docker Image Update Report
+          Host: {{ inventory_hostname }}
+          ============================================================
+
+          Docker: {{ docker_version.stdout }}
+          Docker Compose: NOT AVAILABLE
+      when:
+        - docker_available
+        - not compose_available
